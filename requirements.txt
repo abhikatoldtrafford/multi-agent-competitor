@@ -18,7 +18,7 @@ lxml>=4.9.3  # Faster parser for BeautifulSoup
 # Data processing
 pandas>=2.1.1
 numpy>=1.26.0
-
+scikit-learn
 # Utilities
 python-dateutil>=2.8.2
 pytz>=2023.3
