@@ -125,7 +125,7 @@ def extract_domain(url):
         domain = domain[4:]
     return domain
 
-async def fetch_url(url, timeout=120, max_retries=3, custom_headers=None, cookies=None):
+async def fetch_url(url, timeout=15, max_retries=3, custom_headers=None, cookies=None):
     """Fetch content from a URL with advanced error handling and retries"""
     
     # Rotate user agents to avoid detection
