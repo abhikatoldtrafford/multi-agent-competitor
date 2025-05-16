@@ -1,5 +1,6 @@
 # app.py
 import os
+import random
 import json
 import time
 import logging
@@ -124,41 +125,275 @@ def extract_domain(url):
         domain = domain[4:]
     return domain
 
-async def fetch_url(url, timeout=30):
-    """Fetch content from a URL with error handling"""
+async def fetch_url(url, timeout=30, max_retries=3, custom_headers=None, cookies=None):
+    """Fetch content from a URL with advanced error handling and retries"""
+    
+    # Rotate user agents to avoid detection
+    user_agents = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1'
+    ]
+    
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        'User-Agent': random.choice(user_agents),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Cache-Control': 'max-age=0'
     }
+    
+    # Update headers with custom headers if provided
+    if custom_headers:
+        headers.update(custom_headers)
+    
+    retry_count = 0
+    while retry_count < max_retries:
+        try:
+            async with aiohttp.ClientSession(cookies=cookies) as session:
+                async with session.get(url, headers=headers, timeout=timeout) as response:
+                    if response.status == 200:
+                        return await response.text()
+                    elif response.status == 429:  # Too Many Requests
+                        retry_delay = min(2 ** retry_count, 60)  # Exponential backoff with max 60 seconds
+                        logger.warning(f"Rate limited on {url}, retrying in {retry_delay} seconds")
+                        await asyncio.sleep(retry_delay)
+                    elif response.status == 403:  # Forbidden (likely blocked)
+                        logger.warning(f"Access forbidden to {url}, may be blocking scraping")
+                        # Change user agent for next retry
+                        headers['User-Agent'] = random.choice(user_agents)
+                        await asyncio.sleep(5)
+                    elif 300 <= response.status < 400:  # Handle redirects manually if needed
+                        location = response.headers.get('Location')
+                        if location:
+                            logger.info(f"Following redirect from {url} to {location}")
+                            return await fetch_url(location, timeout, max_retries - retry_count, custom_headers, cookies)
+                        else:
+                            logger.warning(f"Redirect without location from {url}")
+                            return None
+                    else:
+                        logger.warning(f"Failed to fetch {url}: HTTP {response.status}")
+                        if retry_count + 1 < max_retries:
+                            await asyncio.sleep(2)
+                        else:
+                            return None
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout fetching {url}")
+            await asyncio.sleep(5)
+        except aiohttp.ClientError as e:
+            logger.error(f"Client error fetching {url}: {str(e)}")
+            await asyncio.sleep(3)
+        except Exception as e:
+            logger.error(f"Error fetching {url}: {str(e)}")
+            await asyncio.sleep(3)
+        
+        retry_count += 1
+    
+    logger.error(f"Failed to fetch {url} after {max_retries} attempts")
+    return None
+async def extract_with_openai(html_content, extraction_goal, openai_client):
+    """Extract information from HTML using OpenAI when traditional methods fail"""
+    if not html_content:
+        return {"error": "No content provided"}
+    
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=timeout) as response:
-                if response.status == 200:
-                    return await response.text()
-                else:
-                    logger.warning(f"Failed to fetch {url}: HTTP {response.status}")
-                    return None
+        # Clean HTML content
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        # Remove scripts, styles, and other non-content elements
+        for tag in soup(['script', 'style', 'meta', 'link', 'noscript', 'iframe']):
+            tag.extract()
+        
+        # Extract text content
+        text = soup.get_text(separator=' ', strip=True)
+        
+        # Truncate text to avoid token limits (GPT-4 can handle more but better to be safe)
+        text = text[:15000]
+        
+        # Create the prompt for OpenAI
+        prompt = f"""
+        You are an expert web data extractor. I'll provide you with text content extracted from a webpage.
+        
+        Extract the following information: {extraction_goal}
+        
+        Return ONLY a JSON object with the extracted information. Do not include any explanation or additional text.
+        
+        Here's the webpage content:
+        ---
+        {text}
+        ---
+        """
+        
+        # Call OpenAI API for extraction
+        response = openai_client.chat.completions.create(
+            model=CHAT_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": "You extract structured data from web content accurately."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=1000,
+            response_format={"type": "json_object"}
+        )
+        
+        result = response.choices[0].message.content
+        
+        # Parse the JSON response
+        try:
+            return json.loads(result)
+        except json.JSONDecodeError:
+            # If JSON parsing fails, try to extract JSON from the response
+            json_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', result)
+            if json_match:
+                return json.loads(json_match.group(1))
+            
+            # Last resort: extract any JSON-like structure
+            json_match = re.search(r'(\{[\s\S]*\})', result)
+            if json_match:
+                return json.loads(json_match.group(1))
+            
+            return {"error": "Failed to parse OpenAI response", "raw_response": result}
+    
     except Exception as e:
-        logger.error(f"Error fetching {url}: {str(e)}")
-        return None
-
+        logger.error(f"Error using OpenAI for extraction: {str(e)}")
+        return {"error": f"OpenAI extraction failed: {str(e)}"}
 def extract_company_info(html_content):
-    """Extract company name and other info from HTML"""
+    """Extract company name, description, and other metadata from HTML"""
     if not html_content:
         return {"name": "Unknown", "description": ""}
     
-    soup = BeautifulSoup(html_content, 'html.parser')
+    result = {"name": "Unknown", "description": "", "keywords": [], "social_links": {}}
     
-    # Try to find company name from title
-    title = soup.title.string if soup.title else "Unknown"
-    company_name = title.split('-')[0].strip() if '-' in title else title.strip()
+    try:
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        # Extract from JSON-LD structured data (if available)
+        json_ld_data = extract_json_ld(soup)
+        if json_ld_data:
+            if 'Organization' in str(json_ld_data):
+                for item in json_ld_data if isinstance(json_ld_data, list) else [json_ld_data]:
+                    if item.get('@type') in ['Organization', 'Corporation', 'Company', 'LocalBusiness']:
+                        result["name"] = item.get('name', result["name"])
+                        result["description"] = item.get('description', result["description"])
+                        if 'sameAs' in item and isinstance(item['sameAs'], list):
+                            for social in item['sameAs']:
+                                domain = extract_domain(social)
+                                if domain in ['facebook.com', 'twitter.com', 'linkedin.com', 'instagram.com']:
+                                    result["social_links"][domain] = social
+        
+        # Extract company name from various sources if not already found
+        if result["name"] == "Unknown":
+            # Try organization schema
+            org_name = soup.find('meta', property='og:site_name')
+            if org_name and org_name.get('content'):
+                result["name"] = org_name['content']
+                
+            # Try title
+            if result["name"] == "Unknown" and soup.title:
+                title = soup.title.string
+                # Clean title
+                if title:
+                    # Remove common title patterns
+                    title = re.sub(r'(\s*\|.*$|\s*-.*$|\s*–.*$|\s*:.*$)', '', title).strip()
+                    result["name"] = title
+            
+            # Try common header elements
+            if result["name"] == "Unknown":
+                for selector in ['header h1', 'header .logo', '#header .logo', '.header .logo', '.site-title', '.brand', '.logo']:
+                    name_elem = soup.select_one(selector)
+                    if name_elem:
+                        if name_elem.has_attr('alt'):
+                            result["name"] = name_elem['alt']
+                            break
+                        elif name_elem.has_attr('title'):
+                            result["name"] = name_elem['title']
+                            break
+                        elif name_elem.get_text().strip():
+                            result["name"] = name_elem.get_text().strip()
+                            break
+        
+        # Extract description if not already found
+        if not result["description"]:
+            # Try meta description
+            meta_desc = soup.find('meta', attrs={'name': 'description'})
+            if meta_desc and meta_desc.get('content'):
+                result["description"] = meta_desc['content']
+            
+            # Try OpenGraph description
+            if not result["description"]:
+                og_desc = soup.find('meta', property='og:description')
+                if og_desc and og_desc.get('content'):
+                    result["description"] = og_desc['content']
+            
+            # Try Twitter description
+            if not result["description"]:
+                twitter_desc = soup.find('meta', attrs={'name': 'twitter:description'})
+                if twitter_desc and twitter_desc.get('content'):
+                    result["description"] = twitter_desc['content']
+                    
+            # Try the first paragraph in the main content
+            if not result["description"]:
+                for selector in ['main p', '#content p', '.content p', 'article p', '.about-us p', '.about p', '.company-info p']:
+                    p_elems = soup.select(selector)
+                    if p_elems:
+                        desc = p_elems[0].get_text().strip()
+                        if len(desc) > 50:  # Only use if it's substantial
+                            result["description"] = desc
+                            break
+        
+        # Extract keywords
+        keywords_meta = soup.find('meta', attrs={'name': 'keywords'})
+        if keywords_meta and keywords_meta.get('content'):
+            result["keywords"] = [k.strip() for k in keywords_meta['content'].split(',')]
+            
+        # Find social media links
+        if not result["social_links"]:
+            social_patterns = {
+                'facebook.com': re.compile(r'facebook\.com/([^/"\']+)'),
+                'twitter.com': re.compile(r'twitter\.com/([^/"\']+)'),
+                'linkedin.com': re.compile(r'linkedin\.com/(?:company|in)/([^/"\']+)'),
+                'instagram.com': re.compile(r'instagram\.com/([^/"\']+)')
+            }
+            
+            for link in soup.find_all('a', href=True):
+                href = link['href']
+                for domain, pattern in social_patterns.items():
+                    if domain in href:
+                        result["social_links"][domain] = href
+        
+        # Clean and truncate results
+        if result["name"] != "Unknown":
+            result["name"] = result["name"][:100]  # Limit name length
+        
+        if result["description"]:
+            result["description"] = result["description"][:500]  # Limit description length
+            
+    except Exception as e:
+        logger.error(f"Error extracting company info: {str(e)}")
     
-    # Try to find meta description
-    description = ""
-    meta_desc = soup.find('meta', attrs={'name': 'description'})
-    if meta_desc and 'content' in meta_desc.attrs:
-        description = meta_desc['content']
-    
-    return {"name": company_name, "description": description}
+    return result
+
+def extract_json_ld(soup):
+    """Extract and parse JSON-LD data from HTML"""
+    try:
+        json_ld_scripts = soup.find_all('script', type='application/ld+json')
+        for script in json_ld_scripts:
+            try:
+                data = json.loads(script.string)
+                return data
+            except (json.JSONDecodeError, TypeError):
+                continue
+    except Exception as e:
+        logger.error(f"Error extracting JSON-LD: {str(e)}")
+    return None
 
 def save_data(data, filename):
     """Save data to a file"""
@@ -213,7 +448,103 @@ async def safe_parse_json_from_agent(response_text, max_retries=3):
 tasks = {}
 
 # ================ Plugins ================
-
+class ScrapingSessionManager:
+    """Manages sessions for web scraping to maintain cookies and state"""
+    
+    def __init__(self):
+        self.sessions = {}
+        self.cookies = {}
+        self.user_agents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1'
+        ]
+    
+    def get_domain_key(self, url):
+        """Get a domain key for storing session data"""
+        parsed_url = urlparse(url)
+        return parsed_url.netloc
+    
+    async def fetch_with_session(self, url, timeout=30, max_retries=3, custom_headers=None):
+        """Fetch URL content while maintaining session state"""
+        domain = self.get_domain_key(url)
+        
+        # Create headers with the domain's user agent or pick a new one
+        headers = {
+            'User-Agent': self.sessions.get(domain, {}).get('user_agent', random.choice(self.user_agents)),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        }
+        
+        if custom_headers:
+            headers.update(custom_headers)
+        
+        # Get domain cookies or initialize empty
+        cookies = self.cookies.get(domain, {})
+        
+        retry_count = 0
+        while retry_count < max_retries:
+            try:
+                # Create a session or use an existing one
+                if domain not in self.sessions:
+                    self.sessions[domain] = {
+                        'user_agent': headers['User-Agent'],
+                        'last_used': time.time()
+                    }
+                
+                async with aiohttp.ClientSession(cookies=cookies) as session:
+                    async with session.get(url, headers=headers, timeout=timeout) as response:
+                        # Update cookies
+                        if response.cookies:
+                            for key, cookie in response.cookies.items():
+                                cookies[key] = cookie.value
+                            self.cookies[domain] = cookies
+                        
+                        if response.status == 200:
+                            # Update session data
+                            self.sessions[domain]['last_used'] = time.time()
+                            return await response.text()
+                        elif response.status == 429:  # Too Many Requests
+                            retry_delay = min(2 ** retry_count, 60)
+                            logger.warning(f"Rate limited on {url}, retrying in {retry_delay} seconds")
+                            await asyncio.sleep(retry_delay)
+                        elif response.status == 403:  # Forbidden (likely blocked)
+                            logger.warning(f"Access forbidden to {url}, rotating user agent")
+                            # Rotate user agent
+                            headers['User-Agent'] = random.choice(self.user_agents)
+                            self.sessions[domain]['user_agent'] = headers['User-Agent']
+                            await asyncio.sleep(5)
+                        else:
+                            logger.warning(f"Failed to fetch {url}: HTTP {response.status}")
+                            if retry_count + 1 < max_retries:
+                                await asyncio.sleep(2)
+                            else:
+                                return None
+            except Exception as e:
+                logger.error(f"Error in fetch_with_session for {url}: {str(e)}")
+                await asyncio.sleep(2)
+            
+            retry_count += 1
+        
+        return None
+    
+    def clean_old_sessions(self, max_age=3600):
+        """Clean up sessions older than max_age seconds"""
+        current_time = time.time()
+        domains_to_remove = []
+        
+        for domain, session_data in self.sessions.items():
+            if current_time - session_data['last_used'] > max_age:
+                domains_to_remove.append(domain)
+        
+        for domain in domains_to_remove:
+            self.sessions.pop(domain, None)
+            self.cookies.pop(domain, None)
 class WebScraperPlugin:
     """Plugin for web scraping operations"""
     
@@ -258,185 +589,79 @@ class WebScraperPlugin:
     
     @kernel_function(description="Extract product information from a webpage")
     async def extract_products(self, url: str) -> str:
-        """Extract product information from a webpage with improved error handling"""
+        """Extract product information from a webpage with improved detection and OpenAI fallback"""
         try:
             html_content = await fetch_url(url)
             if not html_content:
                 logger.warning(f"Failed to fetch content from {url}")
                 return json.dumps({"products": []})
             
-            soup = BeautifulSoup(html_content, 'html.parser')
-            products = []
+            # First, try to extract structured data (JSON-LD, microdata)
+            products = self.extract_structured_product_data(html_content)
             
-            # Try different approaches to find product containers
-            product_elements = []
+            # If structured data extraction found products, return them
+            if products:
+                logger.info(f"Extracted {len(products)} products using structured data from {url}")
+                return json.dumps({"products": products})
             
-            # Approach 1: Look for common product containers
-            product_elements.extend(soup.find_all(['div', 'article', 'section'], 
-                                          class_=lambda c: c and any(x in str(c).lower() for x in 
-                                                                    ['product', 'item', 'card'])))
+            # Otherwise use traditional HTML parsing
+            products = self.extract_products_from_html(html_content, url)
             
-            # Approach 2: Try to find product listings by HTML structure
-            if not product_elements:
-                product_elements.extend(soup.find_all(['div', 'article', 'li'], 
-                                              class_=lambda c: c and any(x in str(c).lower() for x in 
-                                                                      ['listing', 'result', 'grid-item'])))
-            
-            # Approach 3: Look for any elements with price-like content
-            if not product_elements:
-                price_patterns = [r'\$\d+\.?\d*', r'€\d+\.?\d*', r'£\d+\.?\d*', r'\d+\.?\d*\s*(USD|EUR|GBP)']
-                for pattern in price_patterns:
-                    elements_with_price = soup.find_all(string=re.compile(pattern))
-                    for element in elements_with_price:
-                        parent = element.parent
-                        # Go up a few levels to find a container
-                        for _ in range(3):
-                            if parent and parent.name in ['div', 'article', 'section', 'li']:
-                                if parent not in product_elements:
-                                    product_elements.append(parent)
-                                break
-                            parent = parent.parent if parent else None
-            
-            # Fallback to main containers if still no products found
-            if not product_elements:
-                main_containers = soup.find_all(['main', 'div'], class_=lambda c: c and 'main' in str(c).lower())
-                for container in main_containers:
-                    product_elements.extend(container.find_all(['div', 'article', 'section', 'li'], recursive=True))
-            
-            # Process found elements
-            for element in product_elements[:15]:  # Limit to 15 products to avoid too much processing
-                product = {}
-                
-                # Extract product name from various elements
-                name_candidates = []
-                name_candidates.extend(element.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'strong'], 
-                                                    class_=lambda c: c and any(x in str(c).lower() for x in 
-                                                                            ['title', 'name', 'product'])))
-                name_candidates.extend(element.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'strong']))
-                
-                if name_candidates:
-                    product['name'] = name_candidates[0].get_text().strip()
-                else:
-                    # Skip if no name found - crucial for a product
-                    continue
-                
-                # Extract price with broader patterns
-                price_patterns = [
-                    r'(\$|€|£|USD|EUR|GBP)?\s*(\d+(?:[.,]\d{1,2})?)',
-                    r'(\d+(?:[.,]\d{1,2})?)\s*(\$|€|£|USD|EUR|GBP)',
-                ]
-                
-                price_found = False
-                for pattern in price_patterns:
-                    price_elements = element.find_all(string=re.compile(pattern, re.IGNORECASE))
-                    for price_elem in price_elements:
-                        price_text = price_elem.strip()
-                        price_match = re.search(pattern, price_text, re.IGNORECASE)
-                        if price_match:
-                            # Extract the numeric part of the price
-                            if price_match.group(2):
-                                product['price'] = price_match.group(2).replace(',', '.')
-                            else:
-                                product['price'] = price_match.group(1).replace(',', '.')
-                            price_found = True
-                            break
-                    if price_found:
-                        break
-                
-                # If no price found, set a default
-                if 'price' not in product:
-                    product['price'] = "0.00"
-                
-                # Extract description from various elements
-                desc_candidates = []
-                desc_candidates.extend(element.find_all(['p', 'div'], 
-                                                    class_=lambda c: c and any(x in str(c).lower() for x in 
-                                                                            ['desc', 'detail', 'info', 'about'])))
-                desc_candidates.extend(element.find_all(['p']))
-                
-                if desc_candidates:
-                    product['description'] = desc_candidates[0].get_text().strip()
-                else:
-                    product['description'] = ""
-                
-                # Extract URL with better fallback
-                link_elem = element.find('a')
-                if link_elem and 'href' in link_elem.attrs:
-                    href = link_elem['href']
-                    if not href.startswith(('http://', 'https://')):
-                        base_url = url.rstrip('/')
-                        if href.startswith('/'):
-                            href = f"{base_url}{href}"
-                        else:
-                            href = f"{base_url}/{href}"
-                    product['url'] = href
-                else:
-                    # Use the current URL as fallback
-                    product['url'] = url
-                
-                # Add features if available
-                features = []
-                feature_elements = element.find_all(['ul', 'ol'])
-                for feature_list in feature_elements:
-                    for item in feature_list.find_all('li'):
-                        feature_text = item.get_text().strip()
-                        if feature_text:
-                            features.append(feature_text)
-                
-                if features:
-                    product['features'] = features
-                else:
-                    product['features'] = []
-                
-                # Add to products list
-                products.append(product)
-            
-            # If still no products found, try to extract from structured data (JSON-LD)
+            # If still no products found, use OpenAI to assist
             if not products:
-                json_ld_elements = soup.find_all('script', type='application/ld+json')
-                for json_ld in json_ld_elements:
-                    try:
-                        data = json.loads(json_ld.string)
-                        if '@type' in data and data['@type'] in ['Product', 'ItemList']:
-                            if data['@type'] == 'Product':
-                                product = {
-                                    'name': data.get('name', 'Unknown'),
-                                    'description': data.get('description', ''),
-                                    'url': data.get('url', url),
-                                    'price': str(data.get('offers', {}).get('price', 0)),
-                                    'features': []
-                                }
-                                products.append(product)
-                            elif data['@type'] == 'ItemList' and 'itemListElement' in data:
-                                for item in data['itemListElement']:
-                                    if item.get('@type') == 'Product':
-                                        product = {
-                                            'name': item.get('name', 'Unknown'),
-                                            'description': item.get('description', ''),
-                                            'url': item.get('url', url),
-                                            'price': str(item.get('offers', {}).get('price', 0)),
-                                            'features': []
-                                        }
-                                        products.append(product)
-                    except:
-                        pass
-            
+                logger.info(f"Traditional extraction failed, using OpenAI for {url}")
+                extraction_goal = """
+                Find all products on this page, including:
+                - Product name
+                - Price (as a numerical value without currency symbols)
+                - Description (short if available)
+                - Features (as an array of strings)
+                - Any URLs for each product (or use the main URL if not available)
+                
+                Return as an array of product objects.
+                """
+                
+                openai_client = AzureOpenAI(
+                    api_version=AZURE_OPENAI_API_VERSION,
+                    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+                    api_key=AZURE_OPENAI_API_KEY
+                )
+                
+                openai_result = await extract_with_openai(html_content, extraction_goal, openai_client)
+                
+                if 'products' in openai_result and isinstance(openai_result['products'], list):
+                    products = openai_result['products']
+                    # Ensure proper structure and fields
+                    for product in products:
+                        if 'id' not in product:
+                            product['id'] = str(uuid.uuid4())[:8]
+                        if 'url' not in product or not product['url']:
+                            product['url'] = url
+                        if 'features' not in product:
+                            product['features'] = []
+                        if 'last_updated' not in product:
+                            product['last_updated'] = datetime.now().strftime("%Y-%m-%d")
+                
             # Ensure we found at least some products
             if not products:
-                logger.warning(f"No products found on {url} using standard methods")
+                logger.warning(f"No products found on {url} using any method")
                 
                 # Last resort: create a default product based on page title
                 try:
+                    soup = BeautifulSoup(html_content, 'html.parser')
                     title = soup.title.string if soup.title else "Unknown Product"
                     products = [{
+                        'id': str(uuid.uuid4())[:8],
                         'name': title,
                         'description': "Product information extracted from page",
                         'url': url,
-                        'price': "0.00",
-                        'features': []
+                        'price': 0.0,
+                        'features': [],
+                        'last_updated': datetime.now().strftime("%Y-%m-%d")
                     }]
-                except:
-                    pass
+                except Exception as e:
+                    logger.error(f"Error creating default product: {str(e)}")
+                    products = []
             
             logger.info(f"Extracted {len(products)} products from {url}")
             return json.dumps({"products": products})
@@ -444,6 +669,278 @@ class WebScraperPlugin:
         except Exception as e:
             logger.error(f"Error extracting products from {url}: {str(e)}")
             return json.dumps({"products": []})
+
+    def extract_structured_product_data(self, html_content):
+        """Extract product data from structured data in the page"""
+        products = []
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            
+            # Extract from JSON-LD structured data
+            json_ld_scripts = soup.find_all('script', type='application/ld+json')
+            for script in json_ld_scripts:
+                try:
+                    data = json.loads(script.string)
+                    
+                    # Handle different JSON-LD structures
+                    if isinstance(data, list):
+                        items = data
+                    elif '@graph' in data:
+                        items = data['@graph']
+                    else:
+                        items = [data]
+                    
+                    for item in items:
+                        # Check for Product type
+                        if item.get('@type') == 'Product':
+                            product = {
+                                'id': str(uuid.uuid4())[:8],
+                                'name': item.get('name', 'Unknown Product'),
+                                'description': item.get('description', ''),
+                                'url': item.get('url', ''),
+                                'features': []
+                            }
+                            
+                            # Extract price from offers
+                            if 'offers' in item:
+                                offers = item['offers'] if isinstance(item['offers'], list) else [item['offers']]
+                                for offer in offers:
+                                    if 'price' in offer:
+                                        try:
+                                            product['price'] = float(offer['price'])
+                                            break
+                                        except (ValueError, TypeError):
+                                            pass
+                            
+                            # If no price found
+                            if 'price' not in product:
+                                product['price'] = 0.0
+                            
+                            # Add product features
+                            if 'additionalProperty' in item:
+                                properties = item['additionalProperty']
+                                for prop in properties if isinstance(properties, list) else [properties]:
+                                    if 'name' in prop and 'value' in prop:
+                                        product['features'].append(f"{prop['name']}: {prop['value']}")
+                            
+                            product['last_updated'] = datetime.now().strftime("%Y-%m-%d")
+                            products.append(product)
+                        
+                        # Check for ItemList type
+                        elif item.get('@type') == 'ItemList' and 'itemListElement' in item:
+                            for element in item['itemListElement']:
+                                if isinstance(element, dict) and element.get('item', {}).get('@type') == 'Product':
+                                    product_item = element.get('item', {})
+                                    product = {
+                                        'id': str(uuid.uuid4())[:8],
+                                        'name': product_item.get('name', 'Unknown Product'),
+                                        'description': product_item.get('description', ''),
+                                        'url': product_item.get('url', ''),
+                                        'features': [],
+                                        'last_updated': datetime.now().strftime("%Y-%m-%d")
+                                    }
+                                    
+                                    # Extract price
+                                    if 'offers' in product_item:
+                                        offers = product_item['offers'] if isinstance(product_item['offers'], list) else [product_item['offers']]
+                                        for offer in offers:
+                                            if 'price' in offer:
+                                                try:
+                                                    product['price'] = float(offer['price'])
+                                                    break
+                                                except (ValueError, TypeError):
+                                                    pass
+                                    
+                                    if 'price' not in product:
+                                        product['price'] = 0.0
+                                    
+                                    products.append(product)
+                except Exception as e:
+                    logger.warning(f"Error parsing JSON-LD script: {str(e)}")
+            
+            # Extract from microdata
+            microdata_products = soup.find_all(itemtype=re.compile(r'schema.org/Product'))
+            for product_elem in microdata_products:
+                try:
+                    name_elem = product_elem.find(itemprop='name')
+                    name = name_elem.get_text().strip() if name_elem else 'Unknown Product'
+                    
+                    description_elem = product_elem.find(itemprop='description')
+                    description = description_elem.get_text().strip() if description_elem else ''
+                    
+                    url_elem = product_elem.find(itemprop='url')
+                    url = url_elem['href'] if url_elem and url_elem.has_attr('href') else ''
+                    
+                    # Extract price
+                    price = 0.0
+                    price_elem = product_elem.find(itemprop='price')
+                    if price_elem:
+                        try:
+                            price = float(re.sub(r'[^\d.]', '', price_elem.get_text()))
+                        except (ValueError, TypeError):
+                            pass
+                    
+                    # Extract features
+                    features = []
+                    feature_elems = product_elem.find_all(itemprop='additionalProperty')
+                    for feature in feature_elems:
+                        name_elem = feature.find(itemprop='name')
+                        value_elem = feature.find(itemprop='value')
+                        if name_elem and value_elem:
+                            features.append(f"{name_elem.get_text()}: {value_elem.get_text()}")
+                    
+                    products.append({
+                        'id': str(uuid.uuid4())[:8],
+                        'name': name,
+                        'description': description,
+                        'url': url,
+                        'price': price,
+                        'features': features,
+                        'last_updated': datetime.now().strftime("%Y-%m-%d")
+                    })
+                except Exception as e:
+                    logger.warning(f"Error extracting microdata product: {str(e)}")
+        
+        except Exception as e:
+            logger.error(f"Error extracting structured product data: {str(e)}")
+        
+        return products
+
+    def extract_products_from_html(self, html_content, base_url):
+        """Extract products from HTML using heuristics"""
+        products = []
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            
+            # Common product container patterns
+            product_selectors = [
+                '.product', '.item', '.product-item', '.product-card', '.product-container',
+                '[class*="product"]', '[class*="item"]', '[class*="card"]',
+                '.listing', '.search-result', '[data-product-id]', '[data-item-id]',
+                'li.item', 'div.item', 'article.product', '.grid-item'
+            ]
+            
+            # Find product containers
+            product_elements = []
+            for selector in product_selectors:
+                elements = soup.select(selector)
+                product_elements.extend(elements)
+            
+            # Deduplicate elements (some may match multiple selectors)
+            unique_elements = []
+            for element in product_elements:
+                if element not in unique_elements:
+                    unique_elements.append(element)
+            
+            # Process each product element
+            for element in unique_elements[:30]:  # Limit to 30 products
+                # Extract product name
+                name = None
+                name_selectors = [
+                    '[class*="title"]', '[class*="name"]', 'h1', 'h2', 'h3', 'h4', 'h5',
+                    '[class*="product-name"]', '[class*="product-title"]'
+                ]
+                
+                for selector in name_selectors:
+                    name_elem = element.select_one(selector)
+                    if name_elem and name_elem.get_text().strip():
+                        name = name_elem.get_text().strip()
+                        break
+                
+                # Skip if no name found - crucial for a product
+                if not name:
+                    continue
+                
+                # Extract price
+                price = 0.0
+                price_selectors = [
+                    '[class*="price"]', '[data-price]', '.price', '.amount',
+                    '[class*="cost"]', '[class*="amount"]'
+                ]
+                
+                price_patterns = [
+                    r'(\$|€|£|USD|EUR|GBP)?\s*(\d+(?:[.,]\d{1,2})?)',
+                    r'(\d+(?:[.,]\d{1,2})?)\s*(\$|€|£|USD|EUR|GBP)',
+                ]
+                
+                # Try to find price by selectors
+                for selector in price_selectors:
+                    price_elem = element.select_one(selector)
+                    if price_elem:
+                        price_text = price_elem.get_text().strip()
+                        for pattern in price_patterns:
+                            match = re.search(pattern, price_text)
+                            if match:
+                                try:
+                                    # Extract the numeric part of the price
+                                    price_str = match.group(1) if match.group(1) and match.group(1)[0].isdigit() else match.group(2)
+                                    price = float(price_str.replace(',', '.'))
+                                    break
+                                except (ValueError, TypeError):
+                                    pass
+                    
+                    if price > 0:
+                        break
+                
+                # Extract description
+                description = ""
+                desc_selectors = [
+                    '[class*="desc"]', '[class*="info"]', '[class*="summary"]', 'p', 
+                    '[class*="detail"]', '[class*="text"]'
+                ]
+                
+                for selector in desc_selectors:
+                    desc_elem = element.select_one(selector)
+                    if desc_elem and desc_elem.get_text().strip():
+                        description = desc_elem.get_text().strip()
+                        # Don't break here - try to find the longest description
+                        if len(description) > 30:  # Skip very short descriptions
+                            break
+                
+                # Extract URL
+                url = ""
+                link_elem = element.find('a')
+                if link_elem and link_elem.has_attr('href'):
+                    href = link_elem['href']
+                    # Convert relative URLs to absolute
+                    if not href.startswith(('http://', 'https://')):
+                        if href.startswith('/'):
+                            parsed_base = urlparse(base_url)
+                            url = f"{parsed_base.scheme}://{parsed_base.netloc}{href}"
+                        else:
+                            url = f"{base_url.rstrip('/')}/{href.lstrip('/')}"
+                    else:
+                        url = href
+                
+                # If URL not found, use the base URL
+                if not url:
+                    url = base_url
+                
+                # Extract features
+                features = []
+                feature_elems = element.select('ul li, ol li, [class*="feature"] li, [class*="spec"] li')
+                for feature in feature_elems:
+                    feature_text = feature.get_text().strip()
+                    if feature_text:
+                        features.append(feature_text)
+                
+                # Create product object
+                product = {
+                    'id': str(uuid.uuid4())[:8],
+                    'name': name[:150],  # Limit name length
+                    'price': price,
+                    'description': description[:500],  # Limit description length
+                    'url': url,
+                    'features': features[:10],  # Limit to 10 features
+                    'last_updated': datetime.now().strftime("%Y-%m-%d")
+                }
+                
+                products.append(product)
+            
+        except Exception as e:
+            logger.error(f"Error extracting products from HTML: {str(e)}")
+        
+        return products
 
 class WebSearchPlugin:
     """Plugin for web search operations"""
@@ -1475,7 +1972,18 @@ async def run_tests():
         }
 
 # ================ Main Entry Point ================
+session_manager = ScrapingSessionManager()
 
+# Schedule cleaning of old sessions
+async def clean_sessions_periodically():
+    while True:
+        await asyncio.sleep(3600)  # Clean every hour
+        session_manager.clean_old_sessions()
+
+# Start the cleaning task
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(clean_sessions_periodically())
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
