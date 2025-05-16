@@ -141,7 +141,7 @@ async def fetch_url(url, timeout=120, max_retries=3, custom_headers=None, cookie
         'User-Agent': random.choice(user_agents),
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.5',
-        'Accept-Encoding': 'gzip, deflate, br',  # Explicitly indicate we support Brotli compression
+        'Accept-Encoding': 'gzip, deflate',  # Explicitly exclude 'br' until we're sure it works
         'Connection': 'keep-alive',
         'Upgrade-Insecure-Requests': '1',
         'Sec-Fetch-Dest': 'document',
@@ -188,10 +188,13 @@ async def fetch_url(url, timeout=120, max_retries=3, custom_headers=None, cookie
                             await asyncio.sleep(2)
                         else:
                             return None
-        except aiohttp.client_exceptions.ContentEncodingError as e:
-            logger.error(f"Content encoding error fetching {url}: {str(e)}")
-            # If we encounter a Brotli error, try with a different Accept-Encoding header
-            headers['Accept-Encoding'] = 'gzip, deflate'  # Remove 'br' from supported encodings
+        except aiohttp.ClientPayloadError as e:
+            # This catches all payload errors including content encoding problems
+            logger.error(f"Payload error fetching {url}: {str(e)}")
+            # If we encounter a encoding error, try with a different Accept-Encoding header
+            if 'br' in str(e).lower() or 'brotli' in str(e).lower():
+                headers['Accept-Encoding'] = 'gzip, deflate'  # Ensure 'br' is not included
+                logger.info(f"Removed Brotli from accepted encodings for {url}")
             retry_count += 1
             await asyncio.sleep(2)
         except asyncio.TimeoutError:
