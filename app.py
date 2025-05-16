@@ -175,6 +175,40 @@ def load_data(filename):
             return pickle.load(f)
     return None
 
+# Helper for safe JSON parsing with retries
+async def safe_parse_json_from_agent(response_text, max_retries=3):
+    """Safely parse JSON from agent response with retries"""
+    retries = 0
+    while retries < max_retries:
+        try:
+            # Try to extract JSON from the response if it's wrapped in markdown code blocks
+            json_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', response_text, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(1).strip()
+            else:
+                # If no code blocks, try to find JSON-like structure
+                json_match = re.search(r'(\{[\s\S]*\}|\[[\s\S]*\])', response_text, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(1).strip()
+                else:
+                    json_str = response_text.strip()
+            
+            # Attempt to parse JSON
+            return json.loads(json_str)
+        except json.JSONDecodeError as e:
+            logger.warning(f"JSON parse error (attempt {retries+1}/{max_retries}): {str(e)}")
+            retries += 1
+            if retries < max_retries:
+                # Wait before retrying
+                await asyncio.sleep(1)
+        except Exception as e:
+            logger.error(f"Unexpected error parsing JSON: {str(e)}")
+            break
+    
+    # If all retries fail, return a default empty structure
+    logger.error(f"Failed to parse JSON after {max_retries} attempts")
+    return {"error": "Failed to parse response"}
+
 # Background tasks dictionary to track progress
 tasks = {}
 
@@ -410,6 +444,7 @@ class WebScraperPlugin:
         except Exception as e:
             logger.error(f"Error extracting products from {url}: {str(e)}")
             return json.dumps({"products": []})
+
 class WebSearchPlugin:
     """Plugin for web search operations"""
     
@@ -522,6 +557,18 @@ class CompetitorFinderAgent:
             2. Researching the industry and market
             3. Finding similar companies in the same space
             For each competitor, provide the company name, website URL, and a brief description.
+            
+            ALWAYS return your response in valid JSON format. Use the following structure:
+            {
+                "competitors": [
+                    {
+                        "name": "Competitor Name",
+                        "url": "https://competitor-website.com",
+                        "similarity_score": 0.9,
+                        "description": "Brief description of competitor"
+                    }
+                ]
+            }
             """,
             plugins=[self.web_scraper_plugin, self.web_search_plugin],
         )
@@ -546,48 +593,47 @@ class CompetitorFinderAgent:
             runtime = InProcessRuntime()
             runtime.start()
             
-            response = await self.agent.get_response(messages=task)
+            max_retries = 3
+            response = None
+            
+            for attempt in range(max_retries):
+                try:
+                    response = await self.agent.get_response(messages=task)
+                    break
+                except Exception as e:
+                    logger.warning(f"Agent response error (attempt {attempt+1}/{max_retries}): {str(e)}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2)  # Wait before retrying
+            
+            if not response:
+                logger.error("Failed to get agent response after retries")
+                return []
             
             await runtime.stop_when_idle()
             
-            # Parse the response
+            # Parse the response using the safer method
             response_text = response.message.content
+            data = await safe_parse_json_from_agent(response_text)
             
-            # Extract JSON from response if needed
-            json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(1)
+            # Extract competitors
+            competitors = []
+            if isinstance(data, dict) and "competitors" in data:
+                competitors_data = data["competitors"]
+            elif isinstance(data, list):
+                competitors_data = data
             else:
-                json_str = response_text
-            
-            # Clean up JSON string
-            json_str = re.sub(r'```.*?```', '', json_str, flags=re.DOTALL)
-            json_str = re.sub(r'[^\{\}\[\]"\':\d,.\w\s-]', '', json_str)
-            
-            # Parse competitors
-            try:
-                data = json.loads(json_str)
-                if isinstance(data, dict) and "competitors" in data:
-                    competitors_data = data["competitors"]
-                elif isinstance(data, list):
-                    competitors_data = data
-                else:
-                    competitors_data = []
+                competitors_data = []
                 
-                competitors = []
-                for comp in competitors_data:
-                    if isinstance(comp, dict) and "name" in comp and "url" in comp:
-                        competitors.append(CompetitorInfo(
-                            name=comp.get("name", "Unknown"),
-                            url=comp.get("url", ""),
-                            similarity_score=float(comp.get("similarity_score", 0.5)),
-                            description=comp.get("description", "")
-                        ))
-                
-                return competitors[:count]
-            except json.JSONDecodeError as e:
-                logger.error(f"Error parsing competitors JSON: {str(e)}")
-                return []
+            for comp in competitors_data:
+                if isinstance(comp, dict) and "name" in comp and "url" in comp:
+                    competitors.append(CompetitorInfo(
+                        name=comp.get("name", "Unknown"),
+                        url=comp.get("url", ""),
+                        similarity_score=float(comp.get("similarity_score", 0.5)),
+                        description=comp.get("description", "")
+                    ))
+            
+            return competitors[:count]
         
         except Exception as e:
             logger.error(f"Error in CompetitorFinderAgent: {str(e)}")
@@ -622,7 +668,20 @@ class ProductScraperAgent:
             3. Key features and descriptions
             4. URLs for each product page
             
-            Return structured data for each product found.
+            ALWAYS return your response in valid JSON format. Use the following structure:
+            {
+                "products": [
+                    {
+                        "id": "unique-id",
+                        "name": "Product Name",
+                        "price": 99.99,
+                        "description": "Product description",
+                        "url": "https://product-url.com",
+                        "features": ["Feature 1", "Feature 2"],
+                        "last_updated": "2025-05-16"
+                    }
+                ]
+            }
             """,
             plugins=[self.web_scraper_plugin],
         )
@@ -637,71 +696,70 @@ class ProductScraperAgent:
             history = ChatHistory()
             history.add_user_message(task)
             
-            # Invoke the agent
+            # Invoke the agent with retries
             runtime = InProcessRuntime()
             runtime.start()
             
-            response = await self.agent.get_response(messages=task)
+            max_retries = 3
+            response = None
+            
+            for attempt in range(max_retries):
+                try:
+                    response = await self.agent.get_response(messages=task)
+                    break
+                except Exception as e:
+                    logger.warning(f"Agent response error (attempt {attempt+1}/{max_retries}): {str(e)}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2)  # Wait before retrying
+            
+            if not response:
+                logger.error("Failed to get agent response after retries")
+                return []
             
             await runtime.stop_when_idle()
             
-            # Parse the response
+            # Parse the response using the safer method
             response_text = response.message.content
-            
-            # Extract JSON from response if needed
-            json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(1)
-            else:
-                json_str = response_text
-            
-            # Clean up JSON string
-            json_str = re.sub(r'```.*?```', '', json_str, flags=re.DOTALL)
-            json_str = re.sub(r'[^\{\}\[\]"\':\d,.\w\s-]', '', json_str)
+            data = await safe_parse_json_from_agent(response_text)
             
             # Parse products
-            try:
-                data = json.loads(json_str)
-                if isinstance(data, dict) and "products" in data:
-                    products_data = data["products"]
-                elif isinstance(data, list):
-                    products_data = data
-                else:
-                    products_data = []
-                
-                products = []
-                for prod in products_data:
-                    if isinstance(prod, dict) and "name" in prod:
-                        # Generate a product ID if not present
-                        if "id" not in prod:
-                            prod["id"] = str(uuid.uuid4())[:8]
-                        
-                        # Parse price to float if possible
+            products = []
+            if isinstance(data, dict) and "products" in data:
+                products_data = data["products"]
+            elif isinstance(data, list):
+                products_data = data
+            else:
+                products_data = []
+            
+            for prod in products_data:
+                if isinstance(prod, dict) and "name" in prod:
+                    # Generate a product ID if not present
+                    if "id" not in prod:
+                        prod["id"] = str(uuid.uuid4())[:8]
+                    
+                    # Parse price to float if possible
+                    price = 0.0
+                    try:
+                        price_str = str(prod.get("price", "0")).replace('$', '').replace('€', '').replace('£', '')
+                        price = float(price_str)
+                    except (ValueError, TypeError):
                         price = 0.0
-                        try:
-                            price_str = str(prod.get("price", "0")).replace('$', '').replace('€', '').replace('£', '')
-                            price = float(price_str)
-                        except (ValueError, TypeError):
-                            price = 0.0
-                        
-                        # Set last_updated to current time if not present
-                        if "last_updated" not in prod:
-                            prod["last_updated"] = datetime.now().isoformat()
-                        
-                        products.append(ProductInfo(
-                            id=prod.get("id", str(uuid.uuid4())[:8]),
-                            name=prod.get("name", "Unknown"),
-                            price=price,
-                            description=prod.get("description", ""),
-                            url=prod.get("url", company_url),
-                            features=prod.get("features", []),
-                            last_updated=prod.get("last_updated", datetime.now().isoformat())
-                        ))
-                
-                return products
-            except json.JSONDecodeError as e:
-                logger.error(f"Error parsing products JSON: {str(e)}")
-                return []
+                    
+                    # Set last_updated to current time if not present
+                    if "last_updated" not in prod:
+                        prod["last_updated"] = datetime.now().strftime("%Y-%m-%d")
+                    
+                    products.append(ProductInfo(
+                        id=prod.get("id", str(uuid.uuid4())[:8]),
+                        name=prod.get("name", "Unknown"),
+                        price=price,
+                        description=prod.get("description", ""),
+                        url=prod.get("url", company_url),
+                        features=prod.get("features", []),
+                        last_updated=prod.get("last_updated", datetime.now().strftime("%Y-%m-%d"))
+                    ))
+            
+            return products
         
         except Exception as e:
             logger.error(f"Error in ProductScraperAgent: {str(e)}")
@@ -737,7 +795,24 @@ class MarketSentimentAgent:
             3. Emerging opportunities and threats
             4. User feedback and perceptions
             
-            Return structured data with sentiment scores (MUST be numerical values between -1.0 and 1.0), trends, and supporting sources.
+            ALWAYS return your response in valid JSON format. Use the following structure:
+            {
+                "market_sentiment": {
+                    "overall_sentiment": 0.7,
+                    "key_points": ["Point 1", "Point 2"],
+                    "sources": ["Source 1", "Source 2"]
+                },
+                "market_trends": [
+                    {
+                        "trend": "Trend Name",
+                        "sources": ["Source 1", "Source 2"],
+                        "relevance_score": 0.9,
+                        "description": "Trend description"
+                    }
+                ]
+            }
+            
+            IMPORTANT: Always use numerical values for overall_sentiment and relevance_score (not strings).
             """,
             plugins=[self.web_search_plugin, self.market_trends_plugin],
         )
@@ -768,98 +843,95 @@ class MarketSentimentAgent:
             history = ChatHistory()
             history.add_user_message(task)
             
-            # Invoke the agent
+            # Invoke the agent with retries
             runtime = InProcessRuntime()
             runtime.start()
             
-            response = await self.agent.get_response(messages=task)
+            max_retries = 3
+            response = None
             
-            await runtime.stop_when_idle()
+            for attempt in range(max_retries):
+                try:
+                    response = await self.agent.get_response(messages=task)
+                    break
+                except Exception as e:
+                    logger.warning(f"Agent response error (attempt {attempt+1}/{max_retries}): {str(e)}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2)  # Wait before retrying
             
-            # Parse the response
-            response_text = response.message.content
-            
-            # Extract JSON from response if needed
-            json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(1)
-            else:
-                json_str = response_text
-            
-            # Clean up JSON string
-            json_str = re.sub(r'```.*?```', '', json_str, flags=re.DOTALL)
-            json_str = re.sub(r'[^\{\}\[\]"\':\d,.\w\s-]', '', json_str)
-            
-            # Parse sentiment and trends
-            try:
-                data = json.loads(json_str)
-                
-                # Extract market sentiment with proper type conversion
-                sentiment_data = data.get("market_sentiment", {})
-                
-                # Ensure sentiment score is a float
-                sentiment_score = sentiment_data.get("overall_sentiment", 0.0)
-                if isinstance(sentiment_score, str):
-                    # Convert textual sentiment to numeric value if needed
-                    if sentiment_score.lower() == 'positive':
-                        sentiment_score = 0.7
-                    elif sentiment_score.lower() == 'very positive':
-                        sentiment_score = 0.9
-                    elif sentiment_score.lower() == 'neutral':
-                        sentiment_score = 0.0
-                    elif sentiment_score.lower() == 'negative':
-                        sentiment_score = -0.7
-                    elif sentiment_score.lower() == 'very negative':
-                        sentiment_score = -0.9
-                    else:
-                        # Try to convert string to float, fallback to 0.0
-                        try:
-                            sentiment_score = float(sentiment_score)
-                        except ValueError:
-                            logger.warning(f"Could not convert sentiment score '{sentiment_score}' to float. Using default 0.0")
-                            sentiment_score = 0.0
-                
-                # Ensure sentiment is within -1.0 to 1.0 range
-                sentiment_score = max(-1.0, min(1.0, float(sentiment_score)))
-                
-                sentiment = MarketSentiment(
-                    overall_sentiment=sentiment_score,
-                    key_points=sentiment_data.get("key_points", []),
-                    sources=sentiment_data.get("sources", [])
-                )
-                
-                # Extract market trends with proper type conversion
-                trends_data = data.get("market_trends", [])
-                trends = []
-                for trend_data in trends_data:
-                    # Ensure relevance score is a float
-                    relevance_score = trend_data.get("relevance_score", 0.5)
-                    if isinstance(relevance_score, str):
-                        try:
-                            relevance_score = float(relevance_score)
-                        except ValueError:
-                            logger.warning(f"Could not convert relevance score '{relevance_score}' to float. Using default 0.5")
-                            relevance_score = 0.5
-                    
-                    # Ensure relevance is within 0.0 to 1.0 range
-                    relevance_score = max(0.0, min(1.0, float(relevance_score)))
-                    
-                    trends.append(MarketTrend(
-                        trend=trend_data.get("trend", ""),
-                        sources=trend_data.get("sources", []),
-                        relevance_score=relevance_score,
-                        description=trend_data.get("description", "")
-                    ))
-                
-                return sentiment, trends
-            except json.JSONDecodeError as e:
-                logger.error(f"Error parsing sentiment JSON: {str(e)}")
+            if not response:
+                logger.error("Failed to get agent response after retries")
                 default_sentiment = MarketSentiment(
                     overall_sentiment=0.0,
                     key_points=["Failed to analyze sentiment"],
                     sources=[]
                 )
                 return default_sentiment, []
+            
+            await runtime.stop_when_idle()
+            
+            # Parse the response using the safer method
+            response_text = response.message.content
+            data = await safe_parse_json_from_agent(response_text)
+            
+            # Extract market sentiment with proper type conversion
+            sentiment_data = data.get("market_sentiment", {})
+            
+            # Ensure sentiment score is a float
+            sentiment_score = sentiment_data.get("overall_sentiment", 0.0)
+            if isinstance(sentiment_score, str):
+                # Convert textual sentiment to numeric value if needed
+                if sentiment_score.lower() == 'positive':
+                    sentiment_score = 0.7
+                elif sentiment_score.lower() == 'very positive':
+                    sentiment_score = 0.9
+                elif sentiment_score.lower() == 'neutral':
+                    sentiment_score = 0.0
+                elif sentiment_score.lower() == 'negative':
+                    sentiment_score = -0.7
+                elif sentiment_score.lower() == 'very negative':
+                    sentiment_score = -0.9
+                else:
+                    # Try to convert string to float, fallback to 0.0
+                    try:
+                        sentiment_score = float(sentiment_score)
+                    except ValueError:
+                        logger.warning(f"Could not convert sentiment score '{sentiment_score}' to float. Using default 0.0")
+                        sentiment_score = 0.0
+            
+            # Ensure sentiment is within -1.0 to 1.0 range
+            sentiment_score = max(-1.0, min(1.0, float(sentiment_score)))
+            
+            sentiment = MarketSentiment(
+                overall_sentiment=sentiment_score,
+                key_points=sentiment_data.get("key_points", []),
+                sources=sentiment_data.get("sources", [])
+            )
+            
+            # Extract market trends with proper type conversion
+            trends_data = data.get("market_trends", [])
+            trends = []
+            for trend_data in trends_data:
+                # Ensure relevance score is a float
+                relevance_score = trend_data.get("relevance_score", 0.5)
+                if isinstance(relevance_score, str):
+                    try:
+                        relevance_score = float(relevance_score)
+                    except ValueError:
+                        logger.warning(f"Could not convert relevance score '{relevance_score}' to float. Using default 0.5")
+                        relevance_score = 0.5
+                
+                # Ensure relevance is within 0.0 to 1.0 range
+                relevance_score = max(0.0, min(1.0, float(relevance_score)))
+                
+                trends.append(MarketTrend(
+                    trend=trend_data.get("trend", ""),
+                    sources=trend_data.get("sources", []),
+                    relevance_score=relevance_score,
+                    description=trend_data.get("description", "")
+                ))
+            
+            return sentiment, trends
         
         except Exception as e:
             logger.error(f"Error in MarketSentimentAgent: {str(e)}")
@@ -896,6 +968,18 @@ class InsightGeneratorAgent:
             3. Suggest pricing strategy adjustments
             4. Identify market opportunities and threats
             5. Provide specific, actionable next steps
+            
+            ALWAYS return your response in valid JSON format. Use the following structure:
+            {
+                "insights": [
+                    {
+                        "insight": "Insight description",
+                        "relevance": 0.9,
+                        "action_items": ["Action 1", "Action 2"]
+                    }
+                ],
+                "recommendations": ["Recommendation 1", "Recommendation 2"]
+            }
             
             Your insights should be data-driven, specific, and directly applicable to business decisions.
             """,
@@ -940,48 +1024,46 @@ class InsightGeneratorAgent:
             Focus on practical, actionable insights that can drive business decisions.
             """
             
-            # Invoke the agent
+            # Invoke the agent with retries
             runtime = InProcessRuntime()
             runtime.start()
             
-            response = await self.agent.get_response(messages=task)
+            max_retries = 3
+            response = None
+            
+            for attempt in range(max_retries):
+                try:
+                    response = await self.agent.get_response(messages=task)
+                    break
+                except Exception as e:
+                    logger.warning(f"Agent response error (attempt {attempt+1}/{max_retries}): {str(e)}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2)  # Wait before retrying
+            
+            if not response:
+                logger.error("Failed to get agent response after retries")
+                return [], ["No recommendations could be generated due to an error"]
             
             await runtime.stop_when_idle()
             
-            # Parse the response
+            # Parse the response using the safer method
             response_text = response.message.content
+            data = await safe_parse_json_from_agent(response_text)
             
-            # Extract JSON from response if needed
-            json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(1)
-            else:
-                json_str = response_text
+            # Extract insights
+            insights_data = data.get("insights", [])
+            insights = []
+            for insight_data in insights_data:
+                insights.append(InsightItem(
+                    insight=insight_data.get("insight", ""),
+                    relevance=float(insight_data.get("relevance", 0.5)),
+                    action_items=insight_data.get("action_items", [])
+                ))
             
-            # Clean up JSON string
-            json_str = re.sub(r'```.*?```', '', json_str, flags=re.DOTALL)
+            # Extract recommendations
+            recommendations = data.get("recommendations", [])
             
-            # Parse insights and recommendations
-            try:
-                data = json.loads(json_str)
-                
-                # Extract insights
-                insights_data = data.get("insights", [])
-                insights = []
-                for insight_data in insights_data:
-                    insights.append(InsightItem(
-                        insight=insight_data.get("insight", ""),
-                        relevance=float(insight_data.get("relevance", 0.5)),
-                        action_items=insight_data.get("action_items", [])
-                    ))
-                
-                # Extract recommendations
-                recommendations = data.get("recommendations", [])
-                
-                return insights, recommendations
-            except json.JSONDecodeError as e:
-                logger.error(f"Error parsing insights JSON: {str(e)}")
-                return [], ["No recommendations could be generated due to data parsing error"]
+            return insights, recommendations
         
         except Exception as e:
             logger.error(f"Error in InsightGeneratorAgent: {str(e)}")
@@ -1089,7 +1171,7 @@ async def run_analysis(task_id: str, url: str, depth: int):
         determine the primary industry category. Return just the industry name, nothing else.
         """
         
-        industry_response = await openai_client.chat.completions.create(
+        industry_response = openai_client.chat.completions.create(
            model=CHAT_DEPLOYMENT,
             messages=[
                 {"role": "system", "content": "You are an expert at categorizing businesses into industries."},
