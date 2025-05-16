@@ -43,7 +43,11 @@ AZURE_OPENAI_API_KEY = "97fa8c02f9e64e8ea5434987b11fe6f4"  # In production, use 
 AZURE_OPENAI_API_VERSION = "2024-12-01-preview"
 EMBEDDING_DEPLOYMENT = "text-embedding-3-small"
 CHAT_DEPLOYMENT = "gpt-4.1"  # Replace with your actual deployment name
-
+BLOCKED_DOMAINS = set()
+FAILED_URLS = set()  # URLs that have permanently failed (e.g., 404)
+URL_CACHE = {}       # Cache of successfully fetched content
+MAX_CACHE_SIZE = 1000  # Maximum number of cached responses
+URL_RETRY_LIMITS = {}  # Track retry attempts per domain
 # Initialize the FastAPI app
 app = FastAPI(title="Competitor Intelligence & Market Trends Agent", 
               description="AI agent system for competitor analysis and market trends monitoring")
@@ -116,7 +120,26 @@ class TaskStatus(BaseModel):
     result: Optional[CompetitorAnalysisReport] = None
 
 # ================ Helper Functions ================
+def save_task_result(task_id: str, result: CompetitorAnalysisReport):
+    """Save task result to disk for persistence"""
+    result_path = os.path.join(DATA_DIR, f"task_{task_id}.json")
+    try:
+        with open(result_path, 'w') as f:
+            f.write(result.model_dump_json(indent=2))
+    except Exception as e:
+        logger.error(f"Error saving task result: {str(e)}")
 
+def load_task_result(task_id: str) -> Optional[CompetitorAnalysisReport]:
+    """Load task result from disk if it exists"""
+    result_path = os.path.join(DATA_DIR, f"task_{task_id}.json")
+    if os.path.exists(result_path):
+        try:
+            with open(result_path, 'r') as f:
+                data = json.load(f)
+                return CompetitorAnalysisReport(**data)
+        except Exception as e:
+            logger.error(f"Error loading task result: {str(e)}")
+    return None
 def extract_domain(url):
     """Extract the domain name from a URL"""
     parsed_url = urlparse(url)
@@ -125,8 +148,61 @@ def extract_domain(url):
         domain = domain[4:]
     return domain
 
-async def fetch_url(url, timeout=15, max_retries=3, custom_headers=None, cookies=None):
-    """Fetch content from a URL with advanced error handling and retries"""
+async def fetch_url(url, timeout=15, max_retries=2, custom_headers=None, cookies=None, respect_blocklist=True):
+    """Fetch content from a URL with advanced error handling, caching and blocklist support
+    
+    Args:
+        url: The URL to fetch
+        timeout: Request timeout in seconds
+        max_retries: Maximum number of retry attempts for temporary errors
+        custom_headers: Optional dict of custom headers to include
+        cookies: Optional dict of cookies to include
+        respect_blocklist: Whether to check the blocklist before attempting to fetch
+        
+    Returns:
+        The HTML content as string if successful, None otherwise
+    """
+    # Normalize URL - fix any obvious duplication in path segments
+    parsed_url = urlparse(url)
+    path_segments = parsed_url.path.split('/')
+    normalized_segments = []
+    
+    # Simple URL normalization to fix duplicated path segments
+    for segment in path_segments:
+        if segment and (not normalized_segments or segment != normalized_segments[-1]):
+            normalized_segments.append(segment)
+    
+    normalized_path = '/' + '/'.join(filter(None, normalized_segments))
+    normalized_url = parsed_url._replace(path=normalized_path).geturl()
+    
+    # Use normalized URL for all operations
+    url = normalized_url
+    
+    # Check URL cache first for a hit
+    if url in URL_CACHE:
+        logger.debug(f"Cache hit for {url}")
+        return URL_CACHE[url]
+    
+    # Check if URL is in the permanent failure list
+    if url in FAILED_URLS:
+        logger.info(f"Skipping {url} as it previously failed with a permanent error")
+        return None
+    
+    # Extract domain to check against blocklist
+    domain = parsed_url.netloc
+    
+    # Check if domain is in the blocklist and we should respect it
+    if respect_blocklist and domain in BLOCKED_DOMAINS:
+        logger.info(f"Skipping {url} because domain {domain} is in the blocklist")
+        return None
+    
+    # Check domain retry limits
+    domain_key = f"domain:{domain}"
+    if domain_key in URL_RETRY_LIMITS and URL_RETRY_LIMITS[domain_key] >= 10:
+        logger.warning(f"Domain {domain} has exceeded maximum retry attempts, temporarily blocking")
+        # Add to blocklist temporarily
+        BLOCKED_DOMAINS.add(domain)
+        return None
     
     # Rotate user agents to avoid detection
     user_agents = [
@@ -163,35 +239,84 @@ async def fetch_url(url, timeout=15, max_retries=3, custom_headers=None, cookies
         try:
             async with aiohttp.ClientSession(cookies=cookies, timeout=client_timeout) as session:
                 async with session.get(url, headers=headers) as response:
+                    # Handle successful response
                     if response.status == 200:
-                        return await response.text()
+                        content = await response.text()
+                        
+                        # Cache the successful result (with size check)
+                        if len(URL_CACHE) >= MAX_CACHE_SIZE:
+                            # Simple cache eviction - remove a random item
+                            URL_CACHE.pop(next(iter(URL_CACHE)))
+                        URL_CACHE[url] = content
+                        
+                        # Reset domain retry counter on success
+                        if domain_key in URL_RETRY_LIMITS:
+                            URL_RETRY_LIMITS[domain_key] = 0
+                            
+                        return content
+                    
+                    # Handle permanent errors - add to permanent failure list
+                    elif response.status in [404, 410]:  # Not Found, Gone
+                        logger.warning(f"Permanent error for {url}: HTTP {response.status}")
+                        FAILED_URLS.add(url)
+                        return None
+                        
+                    # Handle rate limiting - use exponential backoff
                     elif response.status == 429:  # Too Many Requests
                         retry_delay = min(2 ** retry_count, 60)  # Exponential backoff with max 60 seconds
                         logger.warning(f"Rate limited on {url}, retrying in {retry_delay} seconds")
+                        
+                        # Increment domain retry counter
+                        URL_RETRY_LIMITS[domain_key] = URL_RETRY_LIMITS.get(domain_key, 0) + 1
+                        
                         await asyncio.sleep(retry_delay)
+                    
+                    # Handle access forbidden - add domain to blocklist
                     elif response.status == 403:  # Forbidden (likely blocked)
-                        logger.warning(f"Access forbidden to {url}, may be blocking scraping")
-                        # Change user agent for next retry
-                        headers['User-Agent'] = random.choice(user_agents)
-                        await asyncio.sleep(5)
-                    elif 300 <= response.status < 400:  # Handle redirects manually if needed
+                        logger.warning(f"Access forbidden to {url}, adding to blocklist")
+                        # Add domain to blocklist
+                        BLOCKED_DOMAINS.add(domain)
+                        return None
+                    
+                    # Handle redirects manually if needed
+                    elif 300 <= response.status < 400:
                         location = response.headers.get('Location')
                         if location:
                             logger.info(f"Following redirect from {url} to {location}")
-                            return await fetch_url(location, timeout, max_retries - retry_count, custom_headers, cookies)
+                            # Prevent redirect loops by checking if we've seen this URL before
+                            if location != url and location not in FAILED_URLS:
+                                return await fetch_url(location, timeout, max_retries - retry_count, custom_headers, cookies)
+                            else:
+                                logger.warning(f"Redirect loop detected for {url}, aborting")
+                                return None
                         else:
                             logger.warning(f"Redirect without location from {url}")
                             return None
+                    
+                    # Handle temporary server errors
+                    elif 500 <= response.status < 600:
+                        logger.warning(f"Server error for {url}: HTTP {response.status}")
+                        # Increment retry counter and domain retry counter
+                        URL_RETRY_LIMITS[domain_key] = URL_RETRY_LIMITS.get(domain_key, 0) + 1
+                        
+                        if retry_count + 1 < max_retries:
+                            retry_delay = min(2 ** retry_count, 30)
+                            await asyncio.sleep(retry_delay)
+                        else:
+                            return None
+                    
+                    # Handle other errors
                     else:
                         logger.warning(f"Failed to fetch {url}: HTTP {response.status}")
                         if retry_count + 1 < max_retries:
                             await asyncio.sleep(2)
                         else:
                             return None
+        
         except aiohttp.ClientPayloadError as e:
             # This catches all payload errors including content encoding problems
             logger.error(f"Payload error fetching {url}: {str(e)}")
-            # If we encounter a encoding error, try with a different Accept-Encoding header
+            # If we encounter an encoding error, try with a different Accept-Encoding header
             if 'br' in str(e).lower() or 'brotli' in str(e).lower():
                 headers['Accept-Encoding'] = 'gzip, deflate'  # Ensure 'br' is not included
                 logger.info(f"Removed Brotli from accepted encodings for {url}")
@@ -199,10 +324,18 @@ async def fetch_url(url, timeout=15, max_retries=3, custom_headers=None, cookies
             await asyncio.sleep(2)
         except asyncio.TimeoutError:
             logger.warning(f"Timeout fetching {url}")
+            
+            # Increment domain retry counter
+            URL_RETRY_LIMITS[domain_key] = URL_RETRY_LIMITS.get(domain_key, 0) + 1
+            
             await asyncio.sleep(5)
             retry_count += 1
         except aiohttp.ClientError as e:
             logger.error(f"Client error fetching {url}: {str(e)}")
+            
+            # Increment domain retry counter
+            URL_RETRY_LIMITS[domain_key] = URL_RETRY_LIMITS.get(domain_key, 0) + 1
+            
             await asyncio.sleep(3)
             retry_count += 1
         except Exception as e:
@@ -211,6 +344,10 @@ async def fetch_url(url, timeout=15, max_retries=3, custom_headers=None, cookies
             retry_count += 1
     
     logger.error(f"Failed to fetch {url} after {max_retries} attempts")
+    
+    # If we got here, we exceeded retries - increment domain retry counter
+    URL_RETRY_LIMITS[domain_key] = URL_RETRY_LIMITS.get(domain_key, 0) + 1
+    
     return None
 async def extract_with_openai(html_content, extraction_goal, openai_client):
     """Extract information from HTML using OpenAI when traditional methods fail"""
@@ -1166,7 +1303,6 @@ class CompetitorFinderAgent:
         except Exception as e:
             logger.error(f"Error in CompetitorFinderAgent: {str(e)}")
             return []
-
 class ProductScraperAgent:
     """Agent to extract product and pricing information from competitor websites"""
     
@@ -1177,7 +1313,7 @@ class ProductScraperAgent:
         # Add plugins to the kernel
         self.web_scraper_plugin = kernel.add_plugin(WebScraperPlugin(), "WebScraper")
         
-        # Create the agent
+        # Create the agent with improved prompt
         self.agent = ChatCompletionAgent(
             name="ProductScraperAgent",
             # Use the explicit service creation with deployment_name instead of ai_model_id
@@ -1189,55 +1325,72 @@ class ProductScraperAgent:
                 api_version=AZURE_OPENAI_API_VERSION
             ),
             instructions="""
-                You are an expert product data extraction specialist with deep e-commerce analysis experience.
+            You are an expert product data extraction specialist with 10+ years of e-commerce analysis experience.
 
-                OBJECTIVE: Extract comprehensive, structured product information from company websites.
+            OBJECTIVE: Extract comprehensive, structured product information from company websites.
 
-                PROCESS:
-                1. FIRST identify product pages or sections on the website:
-                - Look for navigation links to product catalogs, solutions, or offerings
-                - Check for "Products", "Shop", "Solutions", "Services" sections
-                - Identify pricing pages or feature comparison tables
+            PROCESS:
+            1. FIRST identify product pages or sections on the website:
+               - Look for navigation links to product catalogs, solutions, or offerings
+               - Check for "Products", "Shop", "Solutions", "Services" sections
+               - Identify pricing pages or feature comparison tables
 
-                2. For EACH product identified, extract:
-                - Full product name (exactly as displayed, with model numbers if present)
-                - Precise pricing (base price and any tiered/subscription options)
-                - Comprehensive description that captures the value proposition
-                - Complete product URL (absolute path, not relative)
-                - All listed features, specifications and key selling points
-                - Any mentioned release dates, versions, or update information
+            2. For EACH product identified, extract these REQUIRED fields:
+               - name: Full product name exactly as displayed (string)
+               - price: Numeric price value WITHOUT currency symbols (number, e.g. 99.99, not "$99.99")
+               - url: Complete URL to product page (string with full URL)
+               - id: Generate a unique identifier for each product (string)
+               - last_updated: Current date in YYYY-MM-DD format (string)
+               
+            3. Also extract these OPTIONAL fields:
+               - description: Product description (string)
+               - features: Product features as an array of strings (array of strings)
 
-                3. Apply these QUALITY STANDARDS:
-                - Maintain original product terminology and branding
-                - For B2B products without visible pricing, note "Contact for pricing" instead of 0.00
-                - Capture technical specifications in structured format when available
-                - Distinguish between product lines/families and specific models
+            4. Apply these VALIDATION STANDARDS:
+               - ALWAYS include all REQUIRED fields for each product
+               - For B2B products without visible pricing, use 0.0 for price
+               - If a product has no features, use an empty array []
+               - ALWAYS format price as a numeric value (e.g., 99.99), NEVER as a string
+               - ALWAYS format features as an array of strings, even if only one feature
 
-                RESPONSE FORMAT: Return ONLY a JSON object with the 'products' array, with each product containing ALL required fields:
+            If the website is blocked or unavailable, respond with an empty products array.
+            If some fields are missing, use reasonable defaults rather than skipping the product.
 
-                {
-                    "products": [
-                        {
-                            "id": "product-abc123",
-                            "name": "Exact Product Name and Model",
-                            "price": 99.99,
-                            "description": "Comprehensive product description focusing on value proposition",
-                            "url": "https://company.com/products/specific-product",
-                            "features": ["Specific feature 1", "Specific feature 2", "Specific feature 3"],
-                            "last_updated": "2025-05-16"
-                        }
-                    ]
-                }
+            RESPONSE FORMAT: Return ONLY a JSON object with the 'products' array:
 
-                Use floating-point for all prices (not strings), ensure all URLs are absolute, and assign unique IDs.
-                """,
+            {
+                "products": [
+                    {
+                        "id": "unique-id",
+                        "name": "Product Name",
+                        "price": 99.99,
+                        "description": "Product description",
+                        "url": "https://product-url.com",
+                        "features": ["Feature 1", "Feature 2"],
+                        "last_updated": "2025-05-16"
+                    }
+                ]
+            }
+            """,
             plugins=[self.web_scraper_plugin],
         )
     
     async def extract_products(self, company_url: str) -> List[ProductInfo]:
-        """Extract products from a company website"""
+        """Extract products from a company website with improved validation error handling"""
         try:
-            # First, scrape the main page to look for product links
+            # Check if domain is blocked before even trying
+            domain = extract_domain(company_url)
+            if domain in BLOCKED_DOMAINS:
+                logger.warning(f"Skipping product extraction for {company_url} as domain is blocked")
+                return []
+                
+            # First, check if we can access the site at all
+            content = await fetch_url(company_url)
+            if not content:
+                logger.warning(f"Unable to access {company_url} for product extraction")
+                return []
+                
+            # Proceed with product extraction if we can access the site
             task = f"Extract product information from {company_url}. First use the WebScraper plugin to analyze the homepage and find product links. Then extract detailed product information from each link. Return a JSON array of products with id, name, price, description, url, features, and last_updated fields."
             
             # Create a new thread for the conversation
@@ -1279,38 +1432,53 @@ class ProductScraperAgent:
             else:
                 products_data = []
             
-            for prod in products_data:
-                if isinstance(prod, dict) and "name" in prod:
-                    # Generate a product ID if not present
-                    if "id" not in prod:
-                        prod["id"] = str(uuid.uuid4())[:8]
-                    
-                    # Parse price to float if possible
-                    price = 0.0
-                    try:
-                        price_str = str(prod.get("price", "0")).replace('$', '').replace('€', '').replace('£', '')
-                        price = float(price_str)
-                    except (ValueError, TypeError):
-                        price = 0.0
-                    
-                    # Set last_updated to current time if not present
-                    if "last_updated" not in prod:
-                        prod["last_updated"] = datetime.now().strftime("%Y-%m-%d")
-                    
-                    products.append(ProductInfo(
-                        id=prod.get("id", str(uuid.uuid4())[:8]),
-                        name=prod.get("name", "Unknown"),
-                        price=price,
-                        description=prod.get("description", ""),
-                        url=prod.get("url", company_url),
-                        features=prod.get("features", []),
-                        last_updated=prod.get("last_updated", datetime.now().strftime("%Y-%m-%d"))
-                    ))
+            current_date = datetime.now().strftime("%Y-%m-%d")
             
+            for prod in products_data:
+                if isinstance(prod, dict):
+                    try:
+                        # Ensure all required fields are present with proper defaults
+                        product_dict = {
+                            # Required fields with defaults
+                            "id": prod.get("id", str(uuid.uuid4())[:8]),
+                            "name": prod.get("name", "Unknown Product"),
+                            "price": 0.0,  # Default price, will be updated if present
+                            "url": prod.get("url", company_url),
+                            "last_updated": prod.get("last_updated", current_date),
+                            
+                            # Optional fields with defaults
+                            "description": prod.get("description", ""),
+                            "features": []  # Default empty list
+                        }
+                        
+                        # Handle price conversion safely
+                        if "price" in prod:
+                            try:
+                                price_str = str(prod["price"]).replace('$', '').replace('€', '').replace('£', '').strip()
+                                product_dict["price"] = float(price_str) if price_str else 0.0
+                            except (ValueError, TypeError):
+                                logger.warning(f"Invalid price format for product {product_dict['name']}, using 0.0")
+                                product_dict["price"] = 0.0
+                        
+                        # Handle features safely
+                        if "features" in prod:
+                            if isinstance(prod["features"], list):
+                                product_dict["features"] = prod["features"]
+                            elif isinstance(prod["features"], str):
+                                # If features was provided as a string, convert to a single-item list
+                                product_dict["features"] = [prod["features"]]
+                        
+                        # Create ProductInfo object with the validated dictionary
+                        products.append(ProductInfo(**product_dict))
+                    except Exception as e:
+                        logger.error(f"Validation error for product {prod.get('name', 'Unknown')}: {str(e)}")
+                        # Continue with other products rather than failing completely
+            
+            logger.info(f"Successfully extracted {len(products)} products from {company_url}")
             return products
         
         except Exception as e:
-            logger.error(f"Error in ProductScraperAgent: {str(e)}")
+            logger.error(f"Error in ProductScraperAgent for {company_url}: {str(e)}")
             return []
 
 class MarketSentimentAgent:
@@ -1666,7 +1834,7 @@ class InsightGeneratorAgent:
 # ================ Orchestration ================
 
 async def run_analysis(task_id: str, url: str, depth: int):
-    """Run the full competitor and market analysis workflow"""
+    """Run the full competitor and market analysis workflow with improved error handling and parallelization"""
     try:
         # Update task status
         tasks[task_id] = {
@@ -1730,30 +1898,59 @@ async def run_analysis(task_id: str, url: str, depth: int):
         tasks[task_id]["message"] = "Analyzing target company"
         
         content = await fetch_url(url)
+        if not content:
+            raise Exception(f"Unable to access target company website at {url}. Please check the URL and try again.")
+            
         company_info = extract_company_info(content)
         company_name = company_info.get("name", extract_domain(url))
         company_domain = extract_domain(url)
         
-        # Get products for the target company
-        target_products = await product_agent.extract_products(url)
-        
-        # Step 2: Find competitors
+        # Step 2: Run target product extraction and competitor finding IN PARALLEL
         tasks[task_id]["progress"] = 0.4
-        tasks[task_id]["message"] = f"Identifying competitors for {company_name}"
+        tasks[task_id]["message"] = f"Finding competitors and products for {company_name}"
         
-        competitors = await competitor_agent.find_competitors(url, count=5)
+        # Run target product extraction and competitor finding in parallel
+        target_products_task = product_agent.extract_products(url)
+        competitors_task = competitor_agent.find_competitors(url, count=5)
         
-        # Step 3: Extract products from competitors
+        target_products, competitors = await asyncio.gather(
+            target_products_task,
+            competitors_task
+        )
+        
+        # Step 3: Extract products from competitors IN PARALLEL
         tasks[task_id]["progress"] = 0.5
         tasks[task_id]["message"] = "Analyzing competitor products"
         
         all_products = {company_name: target_products}
-        for competitor in competitors:
-            competitor_products = await product_agent.extract_products(competitor.url)
-            all_products[competitor.name] = competitor_products
-            
-            # Add a small delay to avoid rate limiting
-            await asyncio.sleep(1)
+        
+        # Define an async function to extract products safely
+        async def extract_competitor_products(competitor):
+            try:
+                domain = extract_domain(competitor.url)
+                if domain in BLOCKED_DOMAINS:
+                    logger.warning(f"Skipping competitor {competitor.name} ({competitor.url}) as domain is blocked")
+                    return competitor.name, []
+                    
+                # Add a domain-specific check to avoid repeated failures
+                domain_failure_count = sum(1 for url in FAILED_URLS if domain in url)
+                if domain_failure_count > 5:  # If we've had multiple failures for this domain
+                    logger.warning(f"Too many failed URLs for {domain}, skipping further extraction")
+                    return competitor.name, []
+                    
+                competitor_products = await product_agent.extract_products(competitor.url)
+                return competitor.name, competitor_products
+            except Exception as e:
+                logger.error(f"Error extracting products for {competitor.name}: {str(e)}")
+                return competitor.name, []
+        
+        # Run all competitor product extractions in parallel
+        competitor_product_tasks = [extract_competitor_products(comp) for comp in competitors]
+        competitor_products_results = await asyncio.gather(*competitor_product_tasks)
+        
+        # Update all_products dictionary with results
+        for comp_name, comp_products in competitor_products_results:
+            all_products[comp_name] = comp_products
         
         # Step 4: Analyze market sentiment and trends
         tasks[task_id]["progress"] = 0.7
@@ -1804,19 +2001,20 @@ async def run_analysis(task_id: str, url: str, depth: int):
         report_filename = f"{company_domain}_{datetime.now().strftime('%Y%m%d')}.json"
         with open(os.path.join(DATA_DIR, report_filename), 'w') as f:
             f.write(report.model_dump_json(indent=2))
-        
+        save_task_result(task_id, report)
         # Update task status
         tasks[task_id]["status"] = "completed"
         tasks[task_id]["progress"] = 1.0
         tasks[task_id]["message"] = "Analysis completed successfully"
         tasks[task_id]["result"] = report
-        
+        tasks[task_id]["completion_time"] = time.time()
         return report
     
     except Exception as e:
         logger.error(f"Error in analysis workflow: {str(e)}")
         tasks[task_id]["status"] = "failed"
         tasks[task_id]["message"] = f"Analysis failed: {str(e)}"
+        tasks[task_id]["completion_time"] = time.time()
         return None
 
 # ================ API Endpoints ================
@@ -1837,9 +2035,20 @@ async def analyze_competitor(request: CompetitorRequest, background_tasks: Backg
     return CompetitorResponse(task_id=task_id)
 
 @app.get("/status/{task_id}", response_model=TaskStatus)
+@app.get("/status/{task_id}", response_model=TaskStatus)
 async def get_task_status(task_id: str):
     """Get the status of a task"""
     if task_id not in tasks:
+        # Try to load the task result from disk
+        result = load_task_result(task_id)
+        if result:
+            return TaskStatus(
+                task_id=task_id,
+                status="completed",
+                progress=1.0,
+                message="Analysis completed successfully",
+                result=result
+            )
         raise HTTPException(status_code=404, detail="Task not found")
     
     task_info = tasks[task_id]
