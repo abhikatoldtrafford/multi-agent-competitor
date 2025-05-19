@@ -1,34 +1,61 @@
+# Core Web Framework
 fastapi>=0.104.0
 uvicorn>=0.23.2
 pydantic>=2.4.2
-python-multipart>=0.0.6  # For handling form data
-httpx>=0.25.0  # Async HTTP client
+python-multipart>=0.0.6
+httpx>=0.25.0
 
 # Semantic Kernel core
 semantic-kernel>=1.1.0
-semantic-kernel[memory]>=1.1.0  # For memory features
-semantic-kernel[openai]>=1.1.0  # For OpenAI integration
+semantic-kernel[memory]>=1.1.0
+semantic-kernel[openai]>=1.1.0
 
 # Azure OpenAI
 openai>=1.3.0  
+
 # Web scraping and parsing
 beautifulsoup4>=4.12.2
-lxml>=4.9.3  # Faster parser for BeautifulSoup
+lxml>=4.9.3
+trafilatura>=1.6.0  # Advanced content extraction from web pages
 
 # Data processing
 pandas>=2.1.1
 numpy>=1.26.0
-scikit-learn
-brotli
+scikit-learn>=1.3.0  # For similarity calculations and clustering
+
+# Caching & Rate Limiting
+cachetools>=5.3.2  # Better caching implementation
+backoff>=2.2.1  # Advanced exponential backoff for API calls
+ratelimit>=2.2.1  # Improved rate limiting
+
+# Visualization (for market position & competitor comparison)
+matplotlib>=3.8.0
+plotly>=5.18.0
+networkx>=3.2.1  # For relationship graphs
+
+# Parallel Processing
+asyncio-pool>=0.6.0  # Better handling of async tasks
+
+# Document Processing
+PyPDF2>=3.0.1  # PDF processing for uploaded documents
+openpyxl>=3.1.2  # Excel file handling
+
+# Monitoring & Reliability
+prometheus-client>=0.17.1  # For metrics collection
+structlog>=23.2.0  # Better structured logging
+
 # Utilities
 python-dateutil>=2.8.2
 pytz>=2023.3
-aiofiles>=23.2.1  # For async file operations
-tenacity>=8.2.3  # For retrying operations
-tqdm>=4.66.1  # For progress bars
-certifi>=2023.7.22  # For SSL certificates
-chardet>=5.2.0  # For character encoding detection
+aiofiles>=23.2.1
+tenacity>=8.2.3
+tqdm>=4.66.1
+certifi>=2023.7.22
+chardet>=5.2.0
+ujson>=5.8.0
+orjson>=3.9.9
 
-# Optional but recommended
-ujson>=5.8.0  # Faster JSON processing
-orjson>=3.9.9  # Even faster JSON processing for FastAPI
+# Testing
+pytest>=7.4.3
+pytest-asyncio>=0.21.1
+requests-mock>=1.11.0  # For mocking HTTP requests in tests
